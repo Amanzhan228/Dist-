@@ -2,192 +2,234 @@ import threading
 import time
 import random
 import requests
+import sys
 from flask import Flask, request, jsonify
-import argparse
+
+app = Flask(__name__)
 
 # Configuration
 
-ELECTION_TIMEOUT = (3, 6)
-HEARTBEAT_INTERVAL = 1
+NODE_ID = None
+PORT = None
+PEERS = []
 
-# Node State
+ELECTION_RANGE = (0.15, 0.3)
+HEARTBEAT_DELAY = 0.1
 
-class RaftNode:
-    def __init__(self, node_id, port, peers):
-        self.id = node_id
-        self.port = port
-        self.peers = peers
+# Raft State
 
-        self.state = "Follower"
-        self.currentTerm = 0
-        self.votedFor = None
-        self.log = []
-        self.commitIndex = -1
+role = "Follower"
+term = 0
+voted_candidate = None
 
-        self.votesReceived = 0
-        self.lastHeartbeat = time.time()
+log_store = []
+commit_pos = 0
+applied_pos = 0
 
-        self.app = Flask(__name__)
-        self.setup_routes()
+last_contact = time.time()
+timeout_limit = random.uniform(*ELECTION_RANGE)
 
+# Leader-only state
+replica_match = {}
+replica_next = {}
 
-    # Flask Routes
-  
-    def setup_routes(self):
+# Utility Functions
 
-        @self.app.route("/request_vote", methods=["POST"])
-        def request_vote():
-            data = request.json
-            term = data["term"]
-            candidate = data["candidateId"]
-
-            if term > self.currentTerm:
-                self.currentTerm = term
-                self.votedFor = None
-                self.state = "Follower"
-
-            voteGranted = False
-            if term == self.currentTerm and self.votedFor is None:
-                self.votedFor = candidate
-                voteGranted = True
-
-            return jsonify({
-                "term": self.currentTerm,
-                "voteGranted": voteGranted
-            })
-
-        @self.app.route("/append_entries", methods=["POST"])
-        def append_entries():
-            data = request.json
-            term = data["term"]
-            entries = data["entries"]
-
-            if term >= self.currentTerm:
-                self.currentTerm = term
-                self.state = "Follower"
-                self.lastHeartbeat = time.time()
-
-                for entry in entries:
-                    self.log.append(entry)
-
-                return jsonify({"success": True})
-
-            return jsonify({"success": False})
-
-        @self.app.route("/client_command", methods=["POST"])
-        def client_command():
-            if self.state != "Leader":
-                return jsonify({"error": "Not leader"}), 400
-
-            command = request.json["command"]
-            entry = {
-                "term": self.currentTerm,
-                "command": command
-            }
-
-            self.log.append(entry)
-            index = len(self.log) - 1
-            acks = 1
-
-            for peer in self.peers:
-                try:
-                    r = requests.post(
-                        f"http://{peer}/append_entries",
-                        json={
-                            "term": self.currentTerm,
-                            "leaderId": self.id,
-                            "entries": [entry]
-                        },
-                        timeout=1
-                    )
-                    if r.json().get("success"):
-                        acks += 1
-                except:
-                    pass
-
-            if acks > len(self.peers) // 2:
-                self.commitIndex = index
-                print(f"[Leader {self.id}] Entry committed: {command}")
-
-            return jsonify({"status": "ok"})
+def refresh_timeout():
+    global last_contact, timeout_limit
+    last_contact = time.time()
+    timeout_limit = random.uniform(*ELECTION_RANGE)
 
 
-    # Raft Logic
+def step_down(new_term):
+    global role, term, voted_candidate
+    role = "Follower"
+    term = new_term
+    voted_candidate = None
+    refresh_timeout()
 
-    def election_timer(self):
-        while True:
-            time.sleep(0.1)
-            if self.state == "Leader":
-                continue
+# Election Logic
 
-            if time.time() - self.lastHeartbeat > random.uniform(*ELECTION_TIMEOUT):
-                self.start_election()
-
-    def start_election(self):
-        self.state = "Candidate"
-        self.currentTerm += 1
-        self.votedFor = self.id
-        self.votesReceived = 1
-
-        print(f"[Node {self.id}] Candidate (term {self.currentTerm})")
-
-        for peer in self.peers:
-            try:
-                r = requests.post(
-                    f"http://{peer}/request_vote",
-                    json={
-                        "term": self.currentTerm,
-                        "candidateId": self.id
-                    },
-                    timeout=1
-                )
-                if r.json().get("voteGranted"):
-                    self.votesReceived += 1
-            except:
-                pass
-
-        if self.votesReceived > len(self.peers) // 2:
-            self.become_leader()
-
-    def become_leader(self):
-        self.state = "Leader"
-        print(f"[Node {self.id}] Became Leader (term {self.currentTerm})")
-        threading.Thread(target=self.send_heartbeats, daemon=True).start()
-
-    def send_heartbeats(self):
-        while self.state == "Leader":
-            for peer in self.peers:
-                try:
-                    requests.post(
-                        f"http://{peer}/append_entries",
-                        json={
-                            "term": self.currentTerm,
-                            "leaderId": self.id,
-                            "entries": []
-                        },
-                        timeout=1
-                    )
-                except:
-                    pass
-            time.sleep(HEARTBEAT_INTERVAL)
+def election_watchdog():
+    while True:
+        if role != "Leader" and time.time() - last_contact > timeout_limit:
+            initiate_election()
+        time.sleep(0.05)
 
 
-    # Start Node
+def initiate_election():
+    global role, term, voted_candidate
 
-    def start(self):
-        threading.Thread(target=self.election_timer, daemon=True).start()
-        self.app.run(host="0.0.0.0", port=self.port)
+    role = "Candidate"
+    term += 1
+    voted_candidate = NODE_ID
+    votes = 1
+
+    print(f"[{NODE_ID}] Election timeout → Candidate (term {term})")
+
+    for peer in PEERS:
+        try:
+            response = requests.post(
+                f"{peer}/vote",
+                json={"term": term, "candidate": NODE_ID},
+                timeout=1
+            ).json()
+
+            if response.get("granted"):
+                votes += 1
+
+        except:
+            pass
+
+    majority = (len(PEERS) + 1) // 2 + 1
+    if votes >= majority:
+        assume_leadership()
 
 
-# Main
+def assume_leadership():
+    global role
+    role = "Leader"
+    print(f"[{NODE_ID}] Became Leader (term {term})")
+
+    for peer in PEERS:
+        replica_next[peer] = len(log_store) + 1
+        replica_match[peer] = 0
+
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    
+# Heartbeats & Replication
+
+def heartbeat_loop():
+    while role == "Leader":
+        for peer in PEERS:
+            transmit_entries(peer, [])
+        time.sleep(HEARTBEAT_DELAY)
+
+
+def transmit_entries(peer, entries):
+    try:
+        response = requests.post(
+            f"{peer}/append",
+            json={
+                "term": term,
+                "leader": NODE_ID,
+                "entries": entries
+            },
+            timeout=1
+        ).json()
+
+        if response.get("success"):
+            if entries:
+                replica_match[peer] = len(log_store)
+                verify_commit()
+        else:
+            if response.get("term", 0) > term:
+                step_down(response["term"])
+
+    except:
+        pass
+
+
+def verify_commit():
+    global commit_pos, applied_pos
+
+    if role != "Leader":
+        return
+
+    cluster_size = len(PEERS) + 1
+    quorum = cluster_size // 2 + 1
+
+    for idx in range(commit_pos + 1, len(log_store) + 1):
+        confirmations = 1
+
+        for peer in PEERS:
+            if replica_match.get(peer, 0) >= idx:
+                confirmations += 1
+
+        if confirmations >= quorum and log_store[idx - 1]["term"] == term:
+            commit_pos = idx
+            print(f"[{NODE_ID}] Entry committed (index={commit_pos}, term={term})")
+        else:
+            break
+
+    while applied_pos < commit_pos:
+        print(f"[{NODE_ID}] Applied: {log_store[applied_pos]['cmd']}")
+        applied_pos += 1
+# API Endpoints
+@app.route("/vote", methods=["POST"])
+def vote():
+    global voted_candidate, term
+
+    data = request.json
+    incoming_term = data["term"]
+    candidate = data["candidate"]
+
+    if incoming_term < term:
+        return jsonify({"term": term, "granted": False})
+
+    if voted_candidate in (None, candidate):
+        voted_candidate = candidate
+        refresh_timeout()
+        return jsonify({"term": term, "granted": True})
+
+    return jsonify({"term": term, "granted": False})
+
+
+@app.route("/append", methods=["POST"])
+def append():
+    global term, role
+
+    data = request.json
+    incoming_term = data["term"]
+    entries = data.get("entries", [])
+
+    if incoming_term < term:
+        return jsonify({"term": term, "success": False})
+
+    if incoming_term > term:
+        step_down(incoming_term)
+
+    role = "Follower"
+    refresh_timeout()
+
+    for entry in entries:
+        log_store.append({"term": incoming_term, "cmd": entry})
+        print(f"[{NODE_ID}] Log appended: {entry}")
+
+    return jsonify({"term": term, "success": True})
+
+
+@app.route("/command", methods=["POST"])
+def command():
+    if role != "Leader":
+        return jsonify({"success": False, "error": "Not leader"})
+
+    cmd = request.json["command"]
+    log_store.append({"term": term, "cmd": cmd})
+    print(f"[{NODE_ID}] New command: {cmd}")
+
+    for peer in PEERS:
+        transmit_entries(peer, [cmd])
+
+    verify_commit()
+    return jsonify({"success": True})
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--id", required=True)
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--peers", required=True)
-    args = parser.parse_args()
+    if len(sys.argv) < 7:
+        print("Usage: python3 node.py --id <ID> --port <PORT> --peers <A,B>")
+        sys.exit(1)
 
-    peers = args.peers.split(",")
-    node = RaftNode(args.id, args.port, peers)
-    node.start()
+    NODE_ID = sys.argv[2]
+    PORT = int(sys.argv[4])
+
+    peer_ids = sys.argv[6].split(",")
+    peer_table = {
+        "A": "http://10.0.1.136:8000",
+        "B": "http://10.0.1.113:8001",
+        "C": "http://10.0.1.100:8002"
+    }
+
+    PEERS = [peer_table[p] for p in peer_ids]
+
+    threading.Thread(target=election_watchdog, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT)
