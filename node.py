@@ -5,15 +5,13 @@ import requests
 from flask import Flask, request, jsonify
 import argparse
 
-# =========================
 # Configuration
-# =========================
+
 ELECTION_TIMEOUT = (3, 6)
 HEARTBEAT_INTERVAL = 1
 
-# =========================
 # Node State
-# =========================
+
 class RaftNode:
     def __init__(self, node_id, port, peers):
         self.id = node_id
@@ -32,9 +30,9 @@ class RaftNode:
         self.app = Flask(__name__)
         self.setup_routes()
 
-    # =========================
+
     # Flask Routes
-    # =========================
+  
     def setup_routes(self):
 
         @self.app.route("/request_vote", methods=["POST"])
@@ -113,9 +111,9 @@ class RaftNode:
 
             return jsonify({"status": "ok"})
 
-    # =========================
+
     # Raft Logic
-    # =========================
+
     def election_timer(self):
         while True:
             time.sleep(0.1)
@@ -173,16 +171,16 @@ class RaftNode:
                     pass
             time.sleep(HEARTBEAT_INTERVAL)
 
-    # =========================
+
     # Start Node
-    # =========================
+
     def start(self):
         threading.Thread(target=self.election_timer, daemon=True).start()
         self.app.run(host="0.0.0.0", port=self.port)
 
-# =========================
+
 # Main
-# =========================
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--id", required=True)
